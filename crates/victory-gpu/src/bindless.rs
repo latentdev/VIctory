@@ -369,13 +369,18 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
+        compile_cs(SOURCE)
+    }
+
+    /// A compute shader with its root signature inside (`RS`).
+    fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
         let host = crate::host::host().unwrap();
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
         // SAFETY: the source and names outlive the call.
         unsafe {
             D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 s!("heap"),
                 None,
                 None,
@@ -612,5 +617,84 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
         }
+    }
+
+    /// Reads dword 1 of element `lane` of the buffer view at heap slot 3 as
+    /// translated shaders read a buffer by element through the resource
+    /// heap (`victory_shader::emit`, "Buffer views in the heap"): a raw load
+    /// at element × the slot's stride from the view-stride table + offset.
+    const BY_ELEMENT: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), SRV(t1), UAV(u0)"
+ByteAddressBuffer view : register(t0);
+ByteAddressBuffer strides : register(t1);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(32, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    o.Store(id.x * 4, view.Load(id.x * strides.Load(3 * 4) + 4));
+}
+"#;
+
+    /// A structured view the title makes in its heap (32 elements of 12
+    /// bytes) reads right through the host slot made from it, read by
+    /// element as translated shaders read it: raw, at the view-stride
+    /// table's stride. A host slot keeping the title's structured view is
+    /// not raw: NVIDIA bounds the raw load by the view's element count as
+    /// dwords, so elements past the first 128 bytes read 0 (#1835).
+    #[test]
+    fn a_structured_heap_view_reads_by_element_through_its_host_slot() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let src = resource(1, 32 * 12, 1, 0, 1);
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        // Structured: format UNKNOWN, buffer dimension, the default mapping,
+        // then first element 0, 32 elements, a 12-byte stride, no flags.
+        let srv: [u32; 10] = [0, 1, 0x1688, 0, 0, 0, 32, 12, 0, 0];
+        crate::descriptor::create_srv(null, src, &srv, title_heap.start + 32 * 3);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let strides = heap_host.strides().expect("the view-stride table");
+        let (root, pso) = compile_cs(BY_ELEMENT);
+        let (out, data) = host.shared_buffer(32 * 4).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            let l = &list.list;
+            l.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetComputeRootDescriptorTable(0, heap_host.gpu(3));
+            l.SetComputeRootShaderResourceView(1, strides.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            l.SetPipelineState(&pso);
+            l.Dispatch(1, 1, 1);
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        // The title writes after recording, before submitting: element e
+        // is (100 + e, 200 + e, 300 + e).
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        // SAFETY: the buffer's own memory, 32 elements of 12 bytes.
+        let elements = unsafe { std::slice::from_raw_parts_mut(src_bytes.cast::<[u32; 3]>(), 32) };
+        for (e, element) in (0u32..).zip(elements.iter_mut()) {
+            *element = [100 + e, 200 + e, 300 + e];
+        }
+        host.execute(&[&list]);
+        // SAFETY: the mapped output, the GPU done with it.
+        let got = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 32) };
+        let want: Vec<u32> = (200..232).collect();
+        assert_eq!(got, want);
     }
 }
